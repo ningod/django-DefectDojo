@@ -2,7 +2,11 @@
 
 import logging
 import operator
+import json
+import httplib2
 from datetime import datetime
+import googleapiclient.discovery
+from google.oauth2 import service_account
 
 from django.contrib import messages
 from django.contrib.auth.decorators import user_passes_test
@@ -17,21 +21,21 @@ from django.contrib.admin.utils import NestedObjects
 from django.db import DEFAULT_DB_ALIAS
 from tagging.models import Tag
 
-from dojo.filters import TemplateFindingFilter
+from dojo.filters import TemplateFindingFilter, OpenFindingFilter
 from dojo.forms import NoteForm, TestForm, FindingForm, \
     DeleteTestForm, AddFindingForm, \
     ImportScanForm, ReImportScanForm, FindingBulkUpdateForm, JIRAFindingForm
-from dojo.models import Product, Finding, Test, Notes, Note_Type, BurpRawRequestResponse, Endpoint, Stub_Finding, Finding_Template, JIRA_PKey, Cred_Mapping, Dojo_User, JIRA_Issue
+from dojo.models import Product, Finding, Test, Notes, Note_Type, BurpRawRequestResponse, Endpoint, Stub_Finding, Finding_Template, JIRA_PKey, Cred_Mapping, Dojo_User, JIRA_Issue, System_Settings
 from dojo.tools.factory import import_parser_factory
 from dojo.utils import get_page_items, add_breadcrumb, get_cal_event, message, process_notifications, get_system_setting, create_notification, Product_Tab, calculate_grade, log_jira_alert
 from dojo.tasks import add_issue_task, update_issue_task
 from functools import reduce
 
 logger = logging.getLogger(__name__)
-
+parse_logger = logging.getLogger('dojo')
 
 def view_test(request, tid):
-    test = Test.objects.get(id=tid)
+    test = get_object_or_404(Test, pk=tid)
     prod = test.engagement.product
     auth = request.user.is_staff or request.user in prod.authorized_users.all()
     tags = Tag.objects.usage_for_model(Finding)
@@ -41,10 +45,11 @@ def view_test(request, tid):
     notes = test.notes.all()
     person = request.user.username
     findings = Finding.objects.filter(test=test).order_by('numerical_severity')
+    findings = OpenFindingFilter(request.GET, queryset=findings)
     stub_findings = Stub_Finding.objects.filter(test=test)
     cred_test = Cred_Mapping.objects.filter(test=test).select_related('cred_id').order_by('cred_id')
     creds = Cred_Mapping.objects.filter(engagement=test.engagement).select_related('cred_id').order_by('cred_id')
-
+    system_settings = get_object_or_404(System_Settings, id=1)
     if request.method == 'POST' and request.user.is_staff:
         form = NoteForm(request.POST)
         if form.is_valid():
@@ -64,7 +69,7 @@ def view_test(request, tid):
     else:
         form = NoteForm()
 
-    fpage = get_page_items(request, findings, 25)
+    fpage = get_page_items(request, findings.qs, 25)
     sfpage = get_page_items(request, stub_findings, 25)
     show_re_upload = any(test.test_type.name in code for code in ImportScanForm.SCAN_TYPE_CHOICES)
 
@@ -73,11 +78,48 @@ def view_test(request, tid):
     jira_config = JIRA_PKey.objects.filter(product=prod.id).first()
     if jira_config:
         jira_config = jira_config.conf_id
+
+    google_sheets_enabled = system_settings.enable_google_sheets
+    sheet_url = None
+    if google_sheets_enabled:
+        spreadsheet_name = test.engagement.product.name + "-" + test.engagement.name + "-" + str(test.id)
+        system_settings = get_object_or_404(System_Settings, id=1)
+        service_account_info = json.loads(system_settings.credentials)
+        SCOPES = ['https://www.googleapis.com/auth/drive']
+        credentials = service_account.Credentials.from_service_account_info(service_account_info, scopes=SCOPES)
+        try:
+            drive_service = googleapiclient.discovery.build('drive', 'v3', credentials=credentials)
+            folder_id = system_settings.drive_folder_ID
+            files = drive_service.files().list(q="mimeType='application/vnd.google-apps.spreadsheet' and parents in '%s' and name='%s'" % (folder_id, spreadsheet_name),
+                                                  spaces='drive',
+                                                  pageSize=10,
+                                                  fields='files(id, name)').execute()
+        except googleapiclient.errors.HttpError:
+            messages.add_message(
+                request,
+                messages.ERROR,
+                "There is a problem with the Google Sheets Sync Configuration. Contact your system admin to solve the issue. Until fixed Google Shet Sync feature can not be used.",
+                extra_tags="alert-danger",
+            )
+            google_sheets_enabled = False
+        except httplib2.ServerNotFoundError:
+            messages.add_message(
+                request,
+                messages.ERROR,
+                "Unable to reach the Google Sheet API.",
+                extra_tags="alert-danger",
+            )
+        else:
+            spreadsheets = files.get('files')
+            if len(spreadsheets) == 1:
+                spreadsheetId = spreadsheets[0].get('id')
+                sheet_url = 'https://docs.google.com/spreadsheets/d/' + spreadsheetId
     return render(request, 'dojo/view_test.html',
                   {'test': test,
                    'product_tab': product_tab,
                    'findings': fpage,
-                   'findings_count': findings.count(),
+                   'filtered': findings,
+                   'findings_count': findings.qs.count(),
                    'stub_findings': sfpage,
                    'form': form,
                    'notes': notes,
@@ -88,6 +130,8 @@ def view_test(request, tid):
                    'cred_test': cred_test,
                    'tag_input': tags,
                    'jira_config': jira_config,
+                   'show_export': google_sheets_enabled,
+                   'sheet_url': sheet_url
                    })
 
 
@@ -100,7 +144,7 @@ def edit_test(request, tid):
         if form.is_valid():
             new_test = form.save()
             tags = request.POST.getlist('tags')
-            t = ", ".join(tags)
+            t = ", ".join('"{0}"'.format(w) for w in tags)
             new_test.tags = t
             messages.add_message(request,
                                  messages.SUCCESS,
@@ -369,7 +413,7 @@ def add_temp_finding(request, tid, fid):
             new_finding.endpoints.set(form.cleaned_data['endpoints'])
             new_finding.save(false_history=True)
             tags = request.POST.getlist('tags')
-            t = ", ".join(tags)
+            t = ", ".join('"{0}"'.format(w) for w in tags)
             new_finding.tags = t
             if 'jiraform-push_to_jira' in request.POST:
                 jform = JIRAFindingForm(request.POST, prefix='jiraform', enabled=True)
@@ -505,8 +549,8 @@ def finding_bulk_update(request, tid):
                     calculate_grade(test.engagement.product)
 
                 for finding in finds:
-                    from dojo.tasks import async_tool_issue_updater
-                    async_tool_issue_updater.delay(finding)
+                    from dojo.tools import tool_issue_updater
+                    tool_issue_updater.async_tool_issue_update(finding)
 
                     if JIRA_PKey.objects.filter(product=finding.test.engagement.product).count() == 0:
                         log_jira_alert('Finding cannot be pushed to jira as there is no jira configuration for this product.', finding)
@@ -558,6 +602,15 @@ def re_import_scan_results(request, tid):
                 parser = import_parser_factory(file, t, active, verified)
             except ValueError:
                 raise Http404()
+            except Exception as e:
+                messages.add_message(request,
+                                     messages.ERROR,
+                                     "An error has occurred in the parser, please see error "
+                                     "log for details.",
+                                     extra_tags='alert-danger')
+                parse_logger.exception(e)
+                parse_logger.error("Error in parser: {}".format(str(e)))
+                return HttpResponseRedirect(reverse('re_import_scan_results', args=(t.id,)))
 
             try:
                 items = parser.items
@@ -607,7 +660,8 @@ def re_import_scan_results(request, tid):
                         new_items.append(find.id)
                     else:
                         item.test = t
-                        item.date = scan_date
+                        if item.date == timezone.now().date():
+                            item.date = t.target_start
                         item.reporter = request.user
                         item.last_reviewed = timezone.now()
                         item.last_reviewed_by = request.user
@@ -645,6 +699,14 @@ def re_import_scan_results(request, tid):
                     if find:
                         finding_count += 1
                         for endpoint in item.unsaved_endpoints:
+                            ep, created = Endpoint.objects.get_or_create(protocol=endpoint.protocol,
+                                                                         host=endpoint.host,
+                                                                         path=endpoint.path,
+                                                                         query=endpoint.query,
+                                                                         fragment=endpoint.fragment,
+                                                                         product=t.engagement.product)
+                            find.endpoints.add(ep)
+                        for endpoint in form.cleaned_data['endpoints']:
                             ep, created = Endpoint.objects.get_or_create(protocol=endpoint.protocol,
                                                                          host=endpoint.host,
                                                                          path=endpoint.path,
@@ -705,6 +767,7 @@ def re_import_scan_results(request, tid):
 
     product_tab = Product_Tab(engagement.product.id, title="Re-upload a %s" % scan_type, tab="engagements")
     product_tab.setEngagement(engagement)
+    form.fields['endpoints'].queryset = Endpoint.objects.filter(product__id=product_tab.product.id)
     return render(request,
                   'dojo/import_scan_results.html',
                   {'form': form,

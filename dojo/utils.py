@@ -12,7 +12,7 @@ from datetime import date, datetime
 from math import pi, sqrt
 import vobject
 import requests
-from dateutil.relativedelta import relativedelta, MO
+from dateutil.relativedelta import relativedelta, MO, SU
 from django.conf import settings
 from django.core.mail import send_mail
 from django.core.mail import EmailMessage
@@ -75,6 +75,7 @@ def sync_false_history(new_finding, *args, **kwargs):
         super(Finding, new_finding).save(*args, **kwargs)
 
 
+# true if both findings are on an engagement that have a different "deduplication on engagement" configuration
 def is_deduplication_on_engagement_mismatch(new_finding, to_duplicate_finding):
     return not new_finding.test.engagement.deduplication_on_engagement and to_duplicate_finding.test.engagement.deduplication_on_engagement
 
@@ -86,79 +87,200 @@ def sync_dedupe(sender, *args, **kwargs):
         new_finding = kwargs['new_finding']
         deduplicationLogger.debug('sync_dedupe for: ' + str(new_finding.id) +
                     ":" + str(new_finding.title))
-        # ---------------------------------------------------------
-        # 1) Collects all the findings that have the same:
-        #      (title  and static_finding and dynamic_finding)
-        #      or (CWE and static_finding and dynamic_finding)
-        #    as the new one
-        #    (this is "cond1")
-        # ---------------------------------------------------------
-        if new_finding.test.engagement.deduplication_on_engagement:
-            eng_findings_cwe = Finding.objects.filter(
-                test__engagement=new_finding.test.engagement,
-                cwe=new_finding.cwe).exclude(id=new_finding.id).exclude(cwe=0).exclude(duplicate=True)
-            eng_findings_title = Finding.objects.filter(
-                test__engagement=new_finding.test.engagement,
-                title=new_finding.title).exclude(id=new_finding.id).exclude(duplicate=True)
-        else:
-            eng_findings_cwe = Finding.objects.filter(
-                test__engagement__product=new_finding.test.engagement.product,
-                cwe=new_finding.cwe).exclude(id=new_finding.id).exclude(cwe=0).exclude(duplicate=True)
-            eng_findings_title = Finding.objects.filter(
-                test__engagement__product=new_finding.test.engagement.product,
-                title=new_finding.title).exclude(id=new_finding.id).exclude(duplicate=True)
-
-        total_findings = eng_findings_cwe | eng_findings_title
-        deduplicationLogger.debug("Found " +
-            str(len(eng_findings_cwe)) + " findings with same cwe, " +
-            str(len(eng_findings_title)) + " findings with same title: " +
-            str(len(total_findings)) + " findings with either same title or same cwe")
-
-        # total_findings = total_findings.order_by('date')
-        for find in total_findings:
-            flag_endpoints = False
-            flag_line_path = False
-            flag_hash = False
-            if is_deduplication_on_engagement_mismatch(new_finding, find):
-                deduplicationLogger.debug(
-                    'deduplication_on_engagement_mismatch, skipping dedupe.')
-                continue
-            # ---------------------------------------------------------
-            # 2) If existing and new findings have endpoints: compare them all
-            #    Else look at line+file_path
-            #    (if new finding is not static, do not deduplicate)
-            # ---------------------------------------------------------
-            if find.endpoints.count() != 0 and new_finding.endpoints.count() != 0:
-                list1 = [e.host_with_port for e in new_finding.endpoints.all()]
-                list2 = [e.host_with_port for e in find.endpoints.all()]
-                if all(x in list1 for x in list2):
-                    flag_endpoints = True
-            elif new_finding.static_finding and len(new_finding.file_path) > 0:
-                if str(find.line) == str(new_finding.line) and find.file_path == new_finding.file_path:
-                    flag_line_path = True
-                else:
-                    deduplicationLogger.debug("no endpoints on one of the findings and file_path doesn't match")
+        if hasattr(settings, 'DEDUPLICATION_ALGORITHM_PER_PARSER'):
+            scan_type = new_finding.test.test_type.name
+            deduplicationLogger.debug('scan_type for this finding is :' + scan_type)
+            # Default algorithm
+            deduplicationAlgorithm = settings.DEDUPE_ALGO_LEGACY
+            # Check for an override for this scan_type in the deduplication configuration
+            if (scan_type in settings.DEDUPLICATION_ALGORITHM_PER_PARSER):
+                deduplicationAlgorithm = settings.DEDUPLICATION_ALGORITHM_PER_PARSER[scan_type]
+            deduplicationLogger.debug('deduplication algorithm: ' + deduplicationAlgorithm)
+            if(deduplicationAlgorithm == settings.DEDUPE_ALGO_UNIQUE_ID_FROM_TOOL):
+                deduplicate_unique_id_from_tool(new_finding)
+            elif(deduplicationAlgorithm == settings.DEDUPE_ALGO_HASH_CODE):
+                deduplicate_hash_code(new_finding)
+            elif(deduplicationAlgorithm == settings.DEDUPE_ALGO_UNIQUE_ID_FROM_TOOL_OR_HASH_CODE):
+                deduplicate_uid_or_hash_code(new_finding)
             else:
-                deduplicationLogger.debug("no endpoints on one of the findings and the new finding is either dynamic or doesn't have a file_path; Deduplication will not occur")
-            if find.hash_code == new_finding.hash_code:
-                flag_hash = True
+                deduplicate_legacy(new_finding)
+        else:
+            deduplicationLogger.debug("no configuration per parser found; using legacy algorithm")
+            deduplicate_legacy(new_finding)
+
+
+def deduplicate_legacy(new_finding):
+    # ---------------------------------------------------------
+    # 1) Collects all the findings that have the same:
+    #      (title  and static_finding and dynamic_finding)
+    #      or (CWE and static_finding and dynamic_finding)
+    #    as the new one
+    #    (this is "cond1")
+    # ---------------------------------------------------------
+    if new_finding.test.engagement.deduplication_on_engagement:
+        eng_findings_cwe = Finding.objects.filter(
+            test__engagement=new_finding.test.engagement,
+            cwe=new_finding.cwe).exclude(id=new_finding.id).exclude(cwe=0).exclude(duplicate=True)
+        eng_findings_title = Finding.objects.filter(
+            test__engagement=new_finding.test.engagement,
+            title=new_finding.title).exclude(id=new_finding.id).exclude(duplicate=True)
+    else:
+        eng_findings_cwe = Finding.objects.filter(
+            test__engagement__product=new_finding.test.engagement.product,
+            cwe=new_finding.cwe).exclude(id=new_finding.id).exclude(cwe=0).exclude(duplicate=True)
+        eng_findings_title = Finding.objects.filter(
+            test__engagement__product=new_finding.test.engagement.product,
+            title=new_finding.title).exclude(id=new_finding.id).exclude(duplicate=True)
+
+    total_findings = eng_findings_cwe | eng_findings_title
+    deduplicationLogger.debug("Found " +
+        str(len(eng_findings_cwe)) + " findings with same cwe, " +
+        str(len(eng_findings_title)) + " findings with same title: " +
+        str(len(total_findings)) + " findings with either same title or same cwe")
+
+    # total_findings = total_findings.order_by('date')
+    for find in total_findings:
+        flag_endpoints = False
+        flag_line_path = False
+        flag_hash = False
+        if is_deduplication_on_engagement_mismatch(new_finding, find):
             deduplicationLogger.debug(
-                'deduplication flags for new finding ' + str(new_finding.id) + ' and existing finding ' + str(find.id) +
-                ' flag_endpoints: ' + str(flag_endpoints) + ' flag_line_path:' + str(flag_line_path) + ' flag_hash:' + str(flag_hash))
-            # ---------------------------------------------------------
-            # 3) Findings are duplicate if (cond1 is true) and they have the same:
-            #    hash
-            #    and (endpoints or (line and file_path)
-            # ---------------------------------------------------------
-            if ((flag_endpoints or flag_line_path) and flag_hash):
-                deduplicationLogger.debug('New finding ' + str(new_finding.id) + ' is a duplicate of existing finding ' + str(find.id))
-                new_finding.duplicate = True
-                new_finding.active = False
-                new_finding.verified = False
-                new_finding.duplicate_finding = find
-                find.duplicate_list.add(new_finding)
-                find.found_by.add(new_finding.test.test_type)
-                super(Finding, new_finding).save()
+                'deduplication_on_engagement_mismatch, skipping dedupe.')
+            continue
+        # ---------------------------------------------------------
+        # 2) If existing and new findings have endpoints: compare them all
+        #    Else look at line+file_path
+        #    (if new finding is not static, do not deduplicate)
+        # ---------------------------------------------------------
+        if find.endpoints.count() != 0 and new_finding.endpoints.count() != 0:
+            list1 = [e.host_with_port for e in new_finding.endpoints.all()]
+            list2 = [e.host_with_port for e in find.endpoints.all()]
+            if all(x in list1 for x in list2):
+                flag_endpoints = True
+        elif new_finding.static_finding and len(new_finding.file_path) > 0:
+            if str(find.line) == str(new_finding.line) and find.file_path == new_finding.file_path:
+                flag_line_path = True
+            else:
+                deduplicationLogger.debug("no endpoints on one of the findings and file_path doesn't match")
+        else:
+            deduplicationLogger.debug("no endpoints on one of the findings and the new finding is either dynamic or doesn't have a file_path; Deduplication will not occur")
+        if find.hash_code == new_finding.hash_code:
+            flag_hash = True
+        deduplicationLogger.debug(
+            'deduplication flags for new finding ' + str(new_finding.id) + ' and existing finding ' + str(find.id) +
+            ' flag_endpoints: ' + str(flag_endpoints) + ' flag_line_path:' + str(flag_line_path) + ' flag_hash:' + str(flag_hash))
+        # ---------------------------------------------------------
+        # 3) Findings are duplicate if (cond1 is true) and they have the same:
+        #    hash
+        #    and (endpoints or (line and file_path)
+        # ---------------------------------------------------------
+        if ((flag_endpoints or flag_line_path) and flag_hash):
+            set_duplicate(new_finding, find)
+            super(Finding, new_finding).save()
+            break
+
+
+def deduplicate_unique_id_from_tool(new_finding):
+    if new_finding.test.engagement.deduplication_on_engagement:
+        existing_findings = Finding.objects.filter(
+            test__engagement=new_finding.test.engagement,
+            unique_id_from_tool=new_finding.unique_id_from_tool).exclude(
+                id=new_finding.id).exclude(
+                    unique_id_from_tool=None).exclude(
+                        duplicate=True)
+    else:
+        existing_findings = Finding.objects.filter(
+            test__engagement__product=new_finding.test.engagement.product,
+            # the unique_id_from_tool is unique for a given tool: do not compare with other tools
+            test__test_type=new_finding.test.test_type,
+            unique_id_from_tool=new_finding.unique_id_from_tool).exclude(
+                id=new_finding.id).exclude(
+                    unique_id_from_tool=None).exclude(
+                        duplicate=True)
+    deduplicationLogger.debug("Found " +
+        str(len(existing_findings)) + " findings with same unique_id_from_tool")
+    for find in existing_findings:
+        if is_deduplication_on_engagement_mismatch(new_finding, find):
+            deduplicationLogger.debug(
+                'deduplication_on_engagement_mismatch, skipping dedupe.')
+            continue
+        set_duplicate(new_finding, find)
+        super(Finding, new_finding).save()
+        break
+
+
+def deduplicate_hash_code(new_finding):
+    if new_finding.test.engagement.deduplication_on_engagement:
+        existing_findings = Finding.objects.filter(
+            test__engagement=new_finding.test.engagement,
+            hash_code=new_finding.hash_code).exclude(
+                id=new_finding.id).exclude(
+                    hash_code=None).exclude(
+                        duplicate=True)
+    else:
+        existing_findings = Finding.objects.filter(
+            test__engagement__product=new_finding.test.engagement.product,
+            hash_code=new_finding.hash_code).exclude(
+                id=new_finding.id).exclude(
+                    hash_code=None).exclude(
+                        duplicate=True)
+    deduplicationLogger.debug("Found " +
+        str(len(existing_findings)) + " findings with same hash_code")
+    for find in existing_findings:
+        if is_deduplication_on_engagement_mismatch(new_finding, find):
+            deduplicationLogger.debug(
+                'deduplication_on_engagement_mismatch, skipping dedupe.')
+            continue
+        set_duplicate(new_finding, find)
+        super(Finding, new_finding).save()
+        break
+
+
+def deduplicate_uid_or_hash_code(new_finding):
+    if new_finding.test.engagement.deduplication_on_engagement:
+        existing_findings = Finding.objects.filter(
+            Q(hash_code=new_finding.hash_code) |
+            (Q(unique_id_from_tool=new_finding.unique_id_from_tool) & Q(test__test_type=new_finding.test.test_type)),
+            test__engagement=new_finding.test.engagement).exclude(
+                id=new_finding.id).exclude(
+                    hash_code=None).exclude(
+                        duplicate=True)
+    else:
+        existing_findings = Finding.objects.filter(
+            Q(hash_code=new_finding.hash_code) |
+            (Q(unique_id_from_tool=new_finding.unique_id_from_tool) & Q(test__test_type=new_finding.test.test_type)),
+            test__engagement__product=new_finding.test.engagement.product).exclude(
+                id=new_finding.id).exclude(
+                    hash_code=None).exclude(
+                        duplicate=True)
+    deduplicationLogger.debug("Found " +
+        str(len(existing_findings)) + " findings with either the same unique_id_from_tool or hash_code")
+    for find in existing_findings:
+        if is_deduplication_on_engagement_mismatch(new_finding, find):
+            deduplicationLogger.debug(
+                'deduplication_on_engagement_mismatch, skipping dedupe.')
+            continue
+        set_duplicate(new_finding, find)
+        super(Finding, new_finding).save()
+        break
+
+
+def set_duplicate(new_finding, existing_finding):
+    deduplicationLogger.debug('New finding ' + str(new_finding.id) + ' is a duplicate of existing finding ' + str(existing_finding.id))
+    if (existing_finding.is_Mitigated or existing_finding.mitigated) and new_finding.active and not new_finding.is_Mitigated:
+        existing_finding.mitigated = new_finding.mitigated
+        existing_finding.is_Mitigated = new_finding.is_Mitigated
+        existing_finding.active = new_finding.active
+        existing_finding.verified = new_finding.verified
+        existing_finding.notes.create(author=existing_finding.reporter,
+                                      entry="This finding has been automatically re-openend as it was found in recent scans.")
+        existing_finding.save()
+    new_finding.duplicate = True
+    new_finding.active = False
+    new_finding.verified = False
+    new_finding.duplicate_finding = existing_finding
+    existing_finding.duplicate_list.add(new_finding)
+    existing_finding.found_by.add(new_finding.test.test_type)
 
 
 def sync_rules(new_finding, *args, **kwargs):
@@ -422,60 +544,116 @@ def add_breadcrumb(parent=None,
     request.session['dojo_breadcrumbs'] = crumbs
 
 
-def get_punchcard_data(findings, weeks_between, start_date):
-    punchcard = list()
-    ticks = list()
-    highest_count = 0
-    tick = 0
-    week_count = 1
+def get_punchcard_data(findings, start_date, weeks):
+    # use try catch to make sure any teething bugs in the bunchcard don't break the dashboard
+    try:
+        # gather findings over past half year, make sure to start on a sunday
+        first_sunday = start_date - relativedelta(weekday=SU(-1))
+        last_sunday = start_date + relativedelta(weeks=weeks)
 
-    # mon 0, tues 1, wed 2, thurs 3, fri 4, sat 5, sun 6
-    # sat 0, sun 6, mon 5, tue 4, wed 3, thur 2, fri 1
-    day_offset = {0: 5, 1: 4, 2: 3, 3: 2, 4: 1, 5: 0, 6: 6}
-    for x in range(-1, weeks_between):
-        # week starts the monday before
-        new_date = start_date + relativedelta(weeks=x, weekday=MO(1))
-        end_date = new_date + relativedelta(weeks=1)
-        append_tick = True
-        days = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
-        for finding in findings:
-            try:
-                if new_date < datetime.combine(finding.date, datetime.min.time(
-                )).replace(tzinfo=timezone.get_current_timezone()) <= end_date:
-                    # [0,0,(20*.02)]
-                    # [week, day, weight]
-                    days[day_offset[finding.date.weekday()]] += 1
-                    if days[day_offset[finding.date.weekday()]] > highest_count:
-                        highest_count = days[day_offset[
-                            finding.date.weekday()]]
-            except:
-                if new_date < finding.date <= end_date:
-                    # [0,0,(20*.02)]
-                    # [week, day, weight]
-                    days[day_offset[finding.date.weekday()]] += 1
-                    if days[day_offset[finding.date.weekday()]] > highest_count:
-                        highest_count = days[day_offset[
-                            finding.date.weekday()]]
-                pass
+        print(first_sunday)
+        print(last_sunday)
 
-        if sum(days.values()) > 0:
-            for day, count in list(days.items()):
-                punchcard.append([tick, day, count])
-                if append_tick:
-                    ticks.append([
-                        tick,
-                        new_date.strftime(
-                            "<span class='small'>%m/%d<br/>%Y</span>")
-                    ])
-                    append_tick = False
+        # reminder: The first week of a year is the one that contains the year’s first Thursday
+        # so we could have for 29/12/2019: week=1 and year=2019 :-D. So using week number from db is not practical
+
+        severities_by_day = findings.filter(created__gte=first_sunday).filter(created__lt=last_sunday) \
+                                    .values('created__date') \
+                                    .annotate(count=Count('id')) \
+                                    .order_by('created__date')
+
+        # return empty stuff if no findings to be statted
+        if severities_by_day.count() <= 0:
+            return None, None
+
+        # day of the week numbers:
+        # javascript  database python
+        # sun 6         1       6
+        # mon 5         2       0
+        # tue 4         3       1
+        # wed 3         4       2
+        # thu 2         5       3
+        # fri 1         6       4
+        # sat 0         7       5
+
+        # map from python to javascript, do not use week numbers or day numbers from database.
+        day_offset = {0: 5, 1: 4, 2: 3, 3: 2, 4: 1, 5: 0, 6: 6}
+
+        punchcard = list()
+        ticks = list()
+        highest_day_count = 0
+        tick = 0
+        day_counts = [0, 0, 0, 0, 0, 0, 0]
+
+        start_of_week = timezone.make_aware(datetime.combine(first_sunday, datetime.min.time()))
+        start_of_next_week = start_of_week + relativedelta(weeks=1)
+        day_counts = [0, 0, 0, 0, 0, 0, 0]
+
+        for day in severities_by_day:
+            created = day['created__date']
+            day_count = day['count']
+
+            created = timezone.make_aware(datetime.combine(created, datetime.min.time()))
+
+            # print('%s %s %s', created, created.weekday(), calendar.day_name[created.weekday()], day_count)
+
+            if created < start_of_week:
+                raise ValueError('date found outside supported range: ' + str(created))
+            else:
+                if created >= start_of_week and created < start_of_next_week:
+                    # add day count to current week data
+                    day_counts[day_offset[created.weekday()]] = day_count
+                    highest_day_count = max(highest_day_count, day_count)
+                else:
+                    # created >= start_of_next_week, so store current week, prepare for next
+                    while created >= start_of_next_week:
+                        week_data, label = get_week_data(start_of_week, tick, day_counts)
+                        punchcard.extend(week_data)
+                        ticks.append(label)
+                        tick += 1
+
+                        # new week, new values!
+                        day_counts = [0, 0, 0, 0, 0, 0, 0]
+                        start_of_week = start_of_next_week
+                        start_of_next_week += relativedelta(weeks=1)
+
+                    # finally a day that falls into the week bracket
+                    day_counts[day_offset[created.weekday()]] = day_count
+                    highest_day_count = max(highest_day_count, day_count)
+
+        # add week in progress + empty weeks on the end if needed
+        while tick < weeks + 1:
+            print(tick)
+            week_data, label = get_week_data(start_of_week, tick, day_counts)
+            print(week_data, label)
+            punchcard.extend(week_data)
+            ticks.append(label)
             tick += 1
-        week_count += 1
-    # adjust the size
-    ratio = (sqrt(highest_count / pi))
-    for punch in punchcard:
-        punch[2] = (sqrt(punch[2] / pi)) / ratio
 
-    return punchcard, ticks, highest_count
+            day_counts = [0, 0, 0, 0, 0, 0, 0]
+            start_of_week = start_of_next_week
+            start_of_next_week += relativedelta(weeks=1)
+
+        # adjust the size or circles
+        ratio = (sqrt(highest_day_count / pi))
+        for punch in punchcard:
+            # front-end needs both the count for the label and the ratios of the radii of the circles
+            punch.append(punch[2])
+            punch[2] = (sqrt(punch[2] / pi)) / ratio
+
+        return punchcard, ticks
+
+    except Exception as e:
+        logger.exception('Not showing punchcard graph due to exception gathering data', e)
+        return None, None
+
+
+def get_week_data(week_start_date, tick, day_counts):
+    data = []
+    for i in range(0, len(day_counts)):
+        data.append([tick, i, day_counts[i]])
+    label = [tick, week_start_date.strftime("<span class='small'>%m/%d<br/>%Y</span>")]
+    return data, label
 
 
 # 5 params

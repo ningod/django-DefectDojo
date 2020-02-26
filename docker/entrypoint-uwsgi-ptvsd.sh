@@ -18,4 +18,3 @@ exec uwsgi \
   --wsgi dojo.wsgi:application \
   --py-autoreload 1 \
   --enable-threads --lazy-apps --honour-stdin
-  

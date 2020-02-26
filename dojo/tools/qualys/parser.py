@@ -10,6 +10,7 @@
 import argparse
 import csv
 import re
+import datetime
 from dojo.models import Finding, Endpoint
 ################################################################
 
@@ -122,6 +123,18 @@ def issue_r(raw_row, vuln):
         _first_found = str(vuln_details.findtext('FIRST_FOUND'))
         _last_found = str(vuln_details.findtext('LAST_FOUND'))
         _times_found = str(vuln_details.findtext('TIMES_FOUND'))
+
+        _temp['date'] = datetime.datetime.strptime(vuln_details.findtext('LAST_FOUND'), "%Y-%m-%dT%H:%M:%SZ").date()
+        # Vuln_status
+        status = vuln_details.findtext('VULN_STATUS')
+        if status == "Active" or status == "Re-Opened" or status == "New":
+            _temp['active'] = True
+            _temp['mitigated'] = False
+            _temp['mitigation_date'] = None
+        else:
+            _temp['active'] = False
+            _temp['mitigated'] = True
+            _temp['mitigation_date'] = datetime.datetime.strptime(vuln_details.findtext('LAST_FIXED'), "%Y-%m-%dT%H:%M:%SZ").date()
         search = "//GLOSSARY/VULN_DETAILS_LIST/VULN_DETAILS[@id='{}']".format(_gid)
         vuln_item = vuln.find(search)
         if vuln_item is not None:
@@ -160,7 +173,7 @@ def issue_r(raw_row, vuln):
         # The CVE in Qualys report might not have a CVSS score, so findings are informational by default
         # unless we can find map to a Severity OR a CVSS score from the findings detail.
         sev = None
-        if _temp['CVSS_score'] is not None:
+        if _temp['CVSS_score'] is not None and float(_temp['CVSS_score']) > 0:
             if 0.1 <= float(_temp['CVSS_score']) <= 3.9:
                 sev = 'Low'
             elif 4.0 <= float(_temp['CVSS_score']) <= 6.9:
@@ -191,6 +204,8 @@ def issue_r(raw_row, vuln):
                               severity=sev,
                               references=refs,
                               impact=_temp['IMPACT'],
+                              date=_temp['date'],
+                              unique_id_from_tool=_gid,
                               )
 
         else:
@@ -200,7 +215,13 @@ def issue_r(raw_row, vuln):
                               severity=sev,
                               references=_gid,
                               impact=_temp['IMPACT'],
+                              date=_temp['date'],
+                              unique_id_from_tool=_gid,
                               )
+        finding.mitigated = _temp['mitigation_date']
+        finding.is_Mitigated = _temp['mitigated']
+        finding.active = _temp['active']
+        finding.verified = True
         finding.unsaved_endpoints = list()
         finding.unsaved_endpoints.append(ep)
         ret_rows.append(finding)
